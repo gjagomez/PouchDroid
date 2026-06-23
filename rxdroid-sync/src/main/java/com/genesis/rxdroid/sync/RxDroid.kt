@@ -16,12 +16,15 @@ class RxDroid private constructor(
 ) {
     private val collections = mutableSetOf<String>()
 
+    private val deviceId = DeviceId.get(context)
+
     private val syncManager = SyncManager(
         config = config,
         dao = db.documentDao(),
         client = couchClient,
         conflictResolver = ConflictResolver(gson),
-        gson = gson
+        gson = gson,
+        deviceId = deviceId
     )
 
     private val changeWatcher = ChangeWatcher(context, syncManager, collections)

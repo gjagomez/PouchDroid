@@ -346,6 +346,99 @@ stateDiagram-v2
 
 ---
 
+## Multi-Device Sync
+
+PouchDroid uses CouchDB as the central hub. Every device syncs independently with the same CouchDB server. When Device A writes a document, CouchDB notifies all other connected devices via their SSE streams within 1 second.
+
+### Architecture
+
+```mermaid
+flowchart TB
+    subgraph Server
+        CDB[(CouchDB\nCentral Server)]
+    end
+
+    subgraph DeviceA ["Device A (Android)"]
+        RoomA[(Room\nSQLite)]
+        SSE_A["SSE Listener"]
+        PUSH_A["ChangeWatcher"]
+    end
+
+    subgraph DeviceB ["Device B (Android)"]
+        RoomB[(Room\nSQLite)]
+        SSE_B["SSE Listener"]
+        PUSH_B["ChangeWatcher"]
+    end
+
+    subgraph DeviceC ["Device C (Android)"]
+        RoomC[(Room\nSQLite)]
+        SSE_C["SSE Listener"]
+        PUSH_C["ChangeWatcher"]
+    end
+
+    CDB -->|"SSE stream"| SSE_A --> RoomA
+    CDB -->|"SSE stream"| SSE_B --> RoomB
+    CDB -->|"SSE stream"| SSE_C --> RoomC
+
+    PUSH_A -->|"POST /_bulk_docs"| CDB
+    PUSH_B -->|"POST /_bulk_docs"| CDB
+    PUSH_C -->|"POST /_bulk_docs"| CDB
+```
+
+### What happens when two devices edit the same document
+
+```mermaid
+sequenceDiagram
+    participant A as Device A
+    participant CDB as CouchDB
+    participant B as Device B
+
+    Note over A,B: Both devices are online
+
+    A->>CDB: POST /_bulk_docs [{_id:"doc-1", status:"Aprobado", updatedAt: T+10}]
+    CDB-->>A: [{id:"doc-1", rev:"3-abc"}] ✓
+
+    B->>CDB: POST /_bulk_docs [{_id:"doc-1", status:"Rechazado", updatedAt: T+5, _rev:"2-xyz"}]
+    CDB-->>B: [{id:"doc-1", error:"conflict"}]
+
+    Note over B: ConflictResolver: A wins (updatedAt T+10 > T+5)
+    B->>CDB: GET /db/doc-1
+    CDB-->>B: {status:"Aprobado", _rev:"3-abc"}
+    B->>B: update local Room → "Aprobado"
+
+    CDB--)A: SSE: no change needed
+    CDB--)B: SSE: doc-1 updated → Room → UI
+```
+
+### Checkpoint isolation per device
+
+Each device generates a unique ID on first install. This ID is included in the CouchDB checkpoint key so devices never overwrite each other's sync position.
+
+```mermaid
+flowchart LR
+    subgraph CouchDB _local documents
+        CP_A["_local/rxdroid_db_a1b2c3\nsince = 150"]
+        CP_B["_local/rxdroid_db_x9y8z7\nsince = 148"]
+        CP_C["_local/rxdroid_db_m4n5o6\nsince = 149"]
+    end
+
+    DevA["Device A\nID: a1b2c3"] --> CP_A
+    DevB["Device B\nID: x9y8z7"] --> CP_B
+    DevC["Device C\nID: m4n5o6"] --> CP_C
+```
+
+### Behavior summary
+
+| Scenario | Result |
+|---|---|
+| Device A writes, Device B online | Device B receives change via SSE in < 1 second |
+| Device A writes, Device B offline | Device B downloads the change on next sync |
+| Both devices write the same doc simultaneously | Conflict detected, last-write-wins (by `updatedAt`) |
+| Device added to the fleet | Full sync from CouchDB on first start |
+| Device offline for days | Catches up from its own checkpoint on reconnect |
+
+---
+
 ## Requirements
 
 - Android API 24+

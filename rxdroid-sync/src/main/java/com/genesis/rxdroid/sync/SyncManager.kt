@@ -22,9 +22,11 @@ class SyncManager(
     private val dao: DocumentDao,
     private val client: CouchDbClient,
     private val conflictResolver: ConflictResolver,
-    private val gson: Gson
+    private val gson: Gson,
+    private val deviceId: String
 ) {
-    private val checkpointId = "rxdroid_${config.database}"
+    // Checkpoint único por dispositivo — evita colisiones en multi-device
+    private val checkpointId = "rxdroid_${config.database}_$deviceId"
     private val mapType = object : TypeToken<Map<String, Any?>>() {}.type
     private var lastSyncAt: Long = 0L
 
