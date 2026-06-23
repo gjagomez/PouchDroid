@@ -13,8 +13,11 @@ Inspired by [PouchDB](https://pouchdb.com) and [RxDB](https://rxdb.info). Built 
 - **Reactive queries** — collections return `Flow<List<T>>` that update automatically on any local or remote change.
 - **Dynamic JSON** — no data class required. Works with any document structure using `RxDocument`.
 - **Typed mode** — optional data class support for collections with a fixed schema.
-- **Background sync** — WorkManager handles periodic sync and retries when the app is not in the foreground.
-- **Conflict resolution** — last-write-wins by default.
+- **Multi-device sync** — every device syncs independently via CouchDB as the central hub. Changes from one device reach all others in real-time.
+- **Checkpoint isolation** — each device tracks its own sync position using a unique device ID. Devices never overwrite each other's checkpoints.
+- **Two-phase pull** — fetches change IDs first, then document content in chunks. Efficient for large documents and slow connections.
+- **Background sync** — WorkManager handles periodic sync and retries when the app is in the background.
+- **Conflict resolution** — last-write-wins by `updatedAt` field.
 
 ---
 
@@ -51,34 +54,61 @@ dependencies {
 
 ## Quick Start
 
-```kotlin
-// 1. Create the database (once, in Application or Activity)
-val db = RxDroid.create(
-    context = this,
-    config = RxDroidConfig(
-        url      = "https://your-server.com:6984/",
-        username = "admin",
-        password = "password",
-        database = "my_database"
-    )
-)
+### Recommended: initialize in Application class
 
-// 2. Open a collection (dynamic — no data class needed)
+```kotlin
+class MyApp : Application() {
+    lateinit var db: RxDroid
+
+    override fun onCreate() {
+        super.onCreate()
+        db = RxDroid.create(
+            context = this,
+            config = RxDroidConfig(
+                url      = "https://your-server.com:6984/",
+                username = "admin",
+                password = "your_password",
+                database = "my_database"
+            )
+        )
+    }
+}
+```
+
+Then in your `AndroidManifest.xml`:
+
+```xml
+<application
+    android:name=".MyApp"
+    ...>
+```
+
+### Use in an Activity or Fragment
+
+```kotlin
+val app = application as MyApp
+val db  = app.db
+
+// Open a collection (dynamic — no data class needed)
 val formularios = db.collection("formularios")
 
-// 3. Observe changes as a Flow
-formularios.findAll().collect { list ->
-    // Called every time local or remote data changes
+// Observe changes as a Flow
+lifecycleScope.launch {
+    formularios.findAll().collect { list ->
+        // Called every time local or remote data changes
+    }
 }
 
-// 4. Insert a document
-formularios.insert(RxDocument(mapOf(
-    "_id"    to "doc-1",
-    "name"   to "My Document",
-    "status" to "pending"
-)))
+// Insert a document
+lifecycleScope.launch {
+    formularios.insert(RxDocument(mapOf(
+        "_id"    to "doc-1",
+        "name"   to "My Document",
+        "status" to "pending"
+    )))
+}
 
-// 5. Start sync (SSE + WorkManager)
+// Start real-time sync
 db.startSync()
 ```
 
@@ -105,7 +135,7 @@ col.findAll().collect { list ->
 
         // Double-encoded JSON string (field that contains a JSON string)
         val interna = data?.getDataAsDocument("data")
-        val nombre  = interna?.getString("PRIMER_NOMBRE")   // "WENDY"
+        val nombre  = interna?.getString("PRIMER_NOMBRE")    // "WENDY"
         val monto   = interna?.getDouble("MONTO_SOLICITADO") // 9000.0
     }
 }
@@ -155,16 +185,16 @@ productos.insert(Producto(id = "1", nombre = "Café", precio = 9.99))
 ## Collection API
 
 ```kotlin
-val col = db.collection("name")          // dynamic
-val col = db.collection("name", T::class.java)  // typed
+val col = db.collection("name")                // dynamic (RxDocument)
+val col = db.collection("name", T::class.java) // typed
 
-col.findAll(): Flow<List<T>>             // observe all documents
-col.findById(id): Flow<T?>               // observe one document
-col.getAll(): List<T>                    // one-shot read
+col.findAll(): Flow<List<T>>              // observe all documents (reactive)
+col.findById(id): Flow<T?>               // observe one document (reactive)
+col.getAll(): List<T>                    // one-shot read all
 col.getById(id): T?                      // one-shot read by id
 col.insert(doc): String                  // returns the document id
 col.update(id, doc)                      // update existing document
-col.delete(id)                           // soft delete (synced as _deleted)
+col.delete(id)                           // soft delete (synced as _deleted to CouchDB)
 ```
 
 ---
@@ -190,10 +220,10 @@ RxDroidConfig(
 ```kotlin
 db.startSync()        // start SSE + WorkManager + local change watcher
 db.stopSync()         // stop all sync
-db.syncNow()          // trigger immediate one-time sync
-db.pauseLiveSync()    // pause SSE (call in onPause)
-db.resumeLiveSync()   // resume SSE (call in onResume)
-db.syncAll()          // suspend: sync all collections now
+db.syncNow()          // trigger immediate one-time sync via WorkManager
+db.pauseLiveSync()    // pause SSE stream (call in onPause)
+db.resumeLiveSync()   // resume SSE stream (call in onResume)
+db.syncAll()          // suspend function: sync all collections now
 ```
 
 **Recommended lifecycle usage:**
@@ -209,6 +239,22 @@ override fun onPause() {
     db.pauseLiveSync()
 }
 ```
+
+> `pauseLiveSync()` / `resumeLiveSync()` only affect the SSE stream. WorkManager background sync continues regardless of app state.
+
+---
+
+## Sync Status
+
+Every document stored locally has a `syncStatus` field. In most cases the reactive `Flow` from `findAll()` / `findById()` is all you need — the UI updates automatically once a document reaches `SYNCED`.
+
+| Status | Meaning |
+|---|---|
+| `PENDING` | Written locally, not yet sent to CouchDB |
+| `SYNCED` | Confirmed by CouchDB |
+| `CONFLICT` | CouchDB rejected the push and the remote document could not be fetched for comparison |
+
+Conflicts are rare. PouchDroid resolves most automatically using last-write-wins (the document with the higher `updatedAt` wins). A `CONFLICT` status only occurs when the conflict resolver cannot fetch the remote document.
 
 ---
 
@@ -271,6 +317,8 @@ sequenceDiagram
     Flow->>UI: recompose
 ```
 
+The full sync (WorkManager / `syncNow()`) uses a two-phase pull to handle large documents efficiently: first fetch only change IDs from `/_changes`, then fetch document content in chunks of 10 via `/_all_docs`. This avoids loading large JSON bodies unnecessarily.
+
 ---
 
 ### Push — Android to CouchDB (~500ms)
@@ -298,7 +346,7 @@ sequenceDiagram
         CDB-->>CW: [{id, error:"conflict"}]
         CW->>CDB: GET /{db}/{docId}
         CDB-->>CW: remote document state
-        Note over CW: last-write-wins resolution
+        Note over CW: last-write-wins by updatedAt
         CW->>Room: upsert resolved document
         CW->>CDB: POST /_bulk_docs retry
     end
@@ -340,9 +388,10 @@ stateDiagram-v2
 | CouchDB → Android | SSE `/_changes?feed=eventsource` | < 1 second |
 | Android → CouchDB | ChangeWatcher + debounce | ~500ms |
 | Network reconnect | ConnectivityManager callback | ~1 second |
-| App returns to foreground | `resumeLiveSync()` + `syncNow()` | immediate |
+| App returns to foreground | `resumeLiveSync()` | immediate |
 | Background (app closed) | WorkManager periodic | 15 minutes |
-| Retry after error | WorkManager exponential backoff | 5s → 10s → 20s |
+| Retry after error | WorkManager exponential backoff | 30s → 60s → 120s |
+| SSE reconnect after drop | Auto-reconnect | 5 seconds |
 
 ---
 
@@ -412,7 +461,7 @@ sequenceDiagram
 
 ### Checkpoint isolation per device
 
-Each device generates a unique ID on first install. This ID is included in the CouchDB checkpoint key so devices never overwrite each other's sync position.
+On first install, PouchDroid generates a UUID for the device and persists it in SharedPreferences. This ID is included in the CouchDB `_local` checkpoint key, so each device tracks its own sync position independently.
 
 ```mermaid
 flowchart LR
@@ -426,6 +475,8 @@ flowchart LR
     DevB["Device B\nID: x9y8z7"] --> CP_B
     DevC["Device C\nID: m4n5o6"] --> CP_C
 ```
+
+The device ID is generated once and never changes across app updates. Uninstalling and reinstalling generates a new ID, causing a full re-sync from CouchDB on first launch.
 
 ### Behavior summary
 
