@@ -214,26 +214,135 @@ override fun onPause() {
 
 ## How Sync Works
 
-```
-CouchDB (remote)
-    |
-    |-- SSE /_changes?feed=eventsource    <- real-time pull (< 1 second)
-    |-- /_bulk_docs POST                  <- push on local change (~500ms)
-    |
-Room (SQLite local)                       <- always available offline
-    |
-Kotlin Flow                               <- UI updates automatically
-    |
-Your UI
+### Architecture
+
+```mermaid
+flowchart LR
+    subgraph Remote
+        CDB[(CouchDB)]
+    end
+
+    subgraph Android
+        SSE["SSE Listener\n/_changes?feed=eventsource"]
+        SM["SyncManager\npull · push · conflict"]
+        CW["ChangeWatcher\ndebounce 500ms"]
+        WM["WorkManager\nevery 15 min"]
+        Room[(Room\nSQLite)]
+        Flow["Kotlin Flow"]
+        UI["Your UI"]
+    end
+
+    CDB -->|"data: {doc}"| SSE
+    SSE -->|upsert| Room
+    Room -->|emit| Flow
+    Flow -->|recompose| UI
+    UI -->|write| Room
+    Room -->|pendingCount changes| CW
+    CW -->|"POST /_bulk_docs"| CDB
+    WM -->|full sync| SM
+    SM -->|pull + push| CDB
+    SM -->|upsert| Room
 ```
 
-| Direction | Trigger | Latency |
+---
+
+### Pull — CouchDB to Android (real-time)
+
+```mermaid
+sequenceDiagram
+    participant CDB as CouchDB
+    participant SSE as SSE Listener
+    participant Room as Room (SQLite)
+    participant Flow as Kotlin Flow
+    participant UI as Your UI
+
+    Note over CDB,SSE: persistent connection /_changes?feed=eventsource
+
+    CDB->>SSE: data: {"id":"doc-1","doc":{...}}
+    SSE->>Room: dao.upsert(entity)
+    Room->>Flow: emits updated list
+    Flow->>UI: recompose (< 1 second total)
+
+    Note over CDB,SSE: heartbeat every 10s keeps connection alive
+
+    CDB->>SSE: data: {"id":"doc-2","deleted":true}
+    SSE->>Room: dao.softDelete(entity)
+    Room->>Flow: emits updated list
+    Flow->>UI: recompose
+```
+
+---
+
+### Push — Android to CouchDB (~500ms)
+
+```mermaid
+sequenceDiagram
+    participant UI as Your UI
+    participant Room as Room (SQLite)
+    participant CW as ChangeWatcher
+    participant CDB as CouchDB
+
+    UI->>Room: collection.insert(doc)
+    Room-->>UI: returns docId immediately
+
+    Note over Room,CW: syncStatus = PENDING
+
+    Room->>CW: pendingCount flow emits
+    Note over CW: debounce 500ms<br/>(groups rapid writes)
+
+    CW->>CDB: POST /_bulk_docs [{...}]
+
+    alt no conflict
+        CDB-->>Room: [{id, rev}] — mark SYNCED
+    else conflict detected
+        CDB-->>CW: [{id, error:"conflict"}]
+        CW->>CDB: GET /{db}/{docId}
+        CDB-->>CW: remote document state
+        Note over CW: last-write-wins resolution
+        CW->>Room: upsert resolved document
+        CW->>CDB: POST /_bulk_docs retry
+    end
+```
+
+---
+
+### Offline / Online state
+
+```mermaid
+stateDiagram-v2
+    [*] --> Offline
+
+    Offline --> Syncing : network available
+    Syncing --> Online : sync complete
+    Online --> Offline : network lost
+
+    Online --> Syncing : local write detected (~500ms)
+    Online --> Syncing : SSE event received (< 1s)
+    Syncing --> Offline : network lost during sync
+
+    note right of Offline
+        All reads and writes go to
+        Room (SQLite). App works fully.
+        Pending writes queue up.
+    end note
+
+    note right of Online
+        SSE stream is open.
+        Changes arrive in real-time.
+        WorkManager runs every 15 min.
+    end note
+```
+
+---
+
+| Direction | Mechanism | Latency |
 |---|---|---|
-| CouchDB → Android | SSE stream | < 1 second |
-| Android → CouchDB | Local write detected | ~500ms |
-| Network reconnect | ConnectivityManager | ~1 second |
-| Background (app closed) | WorkManager | 15 minutes |
-| Retry on error | Automatic | 5 seconds |
+| CouchDB → Android | SSE `/_changes?feed=eventsource` | < 1 second |
+| Android → CouchDB | ChangeWatcher + debounce | ~500ms |
+| Network reconnect | ConnectivityManager callback | ~1 second |
+| App returns to foreground | `resumeLiveSync()` + `syncNow()` | immediate |
+| Background (app closed) | WorkManager periodic | 15 minutes |
+| Retry after error | WorkManager exponential backoff | 5s → 10s → 20s |
 
 ---
 
