@@ -12,14 +12,16 @@ class ConflictResolver(private val gson: Gson) {
             ?: (remoteData["updated_at"] as? Double)?.toLong()
             ?: 0L
 
+        android.util.Log.d("RxDroid-Conflict", "Resolving conflict for ${local.docId}. Local updated: ${local.updatedAt}, Remote updated: $remoteUpdatedAt")
+
         return if (local.updatedAt >= remoteUpdatedAt) {
-            // local gana: conservar data local pero actualizar _rev para poder hacer push
+            android.util.Log.d("RxDroid-Conflict", "Winner: LOCAL for ${local.docId}")
             local.copy(
                 rev = remoteData["_rev"] as? String ?: local.rev,
                 syncStatus = SyncStatus.PENDING
             )
         } else {
-            // remoto gana: reemplazar data local con la versión del servidor
+            android.util.Log.d("RxDroid-Conflict", "Winner: REMOTE for ${local.docId}")
             local.copy(
                 data = gson.toJson(remoteData),
                 rev = remoteData["_rev"] as? String,

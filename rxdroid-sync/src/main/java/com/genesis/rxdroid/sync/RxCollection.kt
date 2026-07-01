@@ -35,17 +35,25 @@ class RxCollection<T> internal constructor(
 
     // Inserta un documento
     suspend fun insert(doc: T, id: String? = null): String {
-        val json = serialize(doc)
         val docId = id
             ?: extractId(doc)
             ?: UUID.randomUUID().toString()
+
+        // Si es un RxDocument dinámico, nos aseguramos de que el ID esté dentro del JSON
+        val finalJson = if (doc is RxDocument) {
+            val map = doc.toMap().toMutableMap()
+            map["_id"] = docId
+            gson.toJson(map)
+        } else {
+            serialize(doc)
+        }
 
         dao.upsert(
             DocumentEntity(
                 compositeId = "$name|$docId",
                 collection = name,
                 docId = docId,
-                data = json,
+                data = finalJson,
                 updatedAt = System.currentTimeMillis(),
                 syncStatus = SyncStatus.PENDING
             )

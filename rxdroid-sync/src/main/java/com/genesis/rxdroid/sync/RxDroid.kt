@@ -5,7 +5,11 @@ import androidx.work.*
 import com.genesis.rxdroid.sync.couch.CouchDbClient
 import com.genesis.rxdroid.sync.storage.RxDroidDatabase
 import com.google.gson.Gson
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 class RxDroid private constructor(
@@ -14,7 +18,12 @@ class RxDroid private constructor(
     private val db: RxDroidDatabase,
     private val couchClient: CouchDbClient
 ) {
-    private val collections = mutableSetOf<String>()
+    private val collections: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())
+
+    val registeredCollections: Set<String> get() = collections
+
+    private val _lastSyncError = MutableStateFlow<String?>(null)
+    val lastSyncError: StateFlow<String?> = _lastSyncError
 
     private val deviceId = DeviceId.get(context)
 
@@ -27,7 +36,12 @@ class RxDroid private constructor(
         deviceId = deviceId
     )
 
-    private val changeWatcher = ChangeWatcher(context, syncManager, collections)
+    private val changeWatcher = ChangeWatcher(
+        context = context,
+        syncManager = syncManager,
+        collections = collections,
+        onError = { error -> _lastSyncError.value = error }
+    )
 
     private val sseListener = CouchDbSSEListener(
         config = config,
@@ -36,110 +50,122 @@ class RxDroid private constructor(
         gson = gson
     )
 
-    // Modo dinámico — sin data class, para formularios con estructura variable
+    // Nombre único del trabajo periódico de WorkManager para esta base de datos
+    private val workName = "${WORK_NAME_PREFIX}_${config.database}"
+    // Nombre único del trabajo puntual (syncNow) — permite cancelarlo en stopSync()
+    private val workNameOnce = "${WORK_NAME_PREFIX}_once_${config.database}"
+
     fun collection(name: String): RxCollection<RxDocument> {
         collections.add(name)
         return RxCollection.dynamic(name, db.documentDao(), gson)
     }
 
-    // Modo tipado — con data class específica
     fun <T> collection(name: String, type: Class<T>): RxCollection<T> {
         collections.add(name)
         return RxCollection.typed(name, type, db.documentDao(), gson)
     }
 
-    inline fun <reified T> collection(name: String, typed: Boolean): RxCollection<T> =
-        collection(name, T::class.java)
-
     suspend fun syncAll() {
         collections.forEach { syncManager.sync(it) }
     }
 
-    /**
-     * Inicia sincronización completa:
-     *
-     * 1. SSE  — CouchDB → Room en tiempo real (como RxDB pull.stream$)
-     * 2. Push — Room → CouchDB en ~500ms tras cambio local (como RxDB upstream)
-     * 3. Red  — sync inmediato al reconectarse
-     * 4. WorkManager — respaldo periódico en background
-     */
     fun startSync() {
-        // 1. SSE: escucha cambios remotos en tiempo real
         if (config.liveSync) {
-            collections.forEach { collection ->
-                sseListener.start(collection, since = "now")
-            }
+            collections.forEach { sseListener.start(it, since = "now") }
         }
-
-        // 2. Push inmediato cuando hay cambios locales pendientes
         val pendingFlow = db.documentDao().observePendingCount().map { Unit }
         changeWatcher.watchLocalChanges(pendingFlow)
-
-        // 3. Sync inmediato al recuperar red
         changeWatcher.watchNetwork()
-
-        // 4. WorkManager como respaldo cada 15 min
-        startPeriodicSync()
+        if (config.backgroundSync) startPeriodicSync()
     }
 
     fun stopSync() {
-        sseListener.stop()
+        sseListener.destroy()
         changeWatcher.stop()
-        WorkManager.getInstance(context).cancelUniqueWork(WORK_NAME)
+        val wm = WorkManager.getInstance(context)
+        wm.cancelUniqueWork(workName)
+        wm.cancelUniqueWork(workNameOnce)
     }
 
-    // Pausa SSE (cuando la app va a background)
     fun pauseLiveSync() {
         sseListener.stop()
     }
 
-    // Reanuda SSE (cuando la app vuelve a primer plano)
     fun resumeLiveSync() {
-        if (config.liveSync) {
-            collections.forEach { sseListener.start(it, since = "now") }
-        }
+        if (!config.liveSync) return
+        syncNow()
+        collections.forEach { sseListener.start(it) }
     }
 
     fun syncNow() {
         val request = OneTimeWorkRequestBuilder<SyncWorker>()
-            .setConstraints(
-                Constraints.Builder()
-                    .setRequiredNetworkType(NetworkType.CONNECTED)
-                    .build()
-            ).build()
-        WorkManager.getInstance(context).enqueue(request)
+            .setInputData(buildInputData())
+            .setConstraints(buildConstraints())
+            .build()
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            workNameOnce,
+            ExistingWorkPolicy.REPLACE,
+            request
+        )
+    }
+
+    fun enableBackgroundSync() {
+        startPeriodicSync()
+    }
+
+    fun disableBackgroundSync() {
+        WorkManager.getInstance(context).cancelUniqueWork(workName)
     }
 
     private fun startPeriodicSync() {
         val request = PeriodicWorkRequestBuilder<SyncWorker>(
             config.syncIntervalMinutes, TimeUnit.MINUTES
-        ).setConstraints(
-            Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
-                .build()
-        ).setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+        ).setInputData(buildInputData())
+            .setConstraints(buildConstraints())
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
 
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
-            WORK_NAME,
-            ExistingPeriodicWorkPolicy.KEEP,
+            workName,
+            ExistingPeriodicWorkPolicy.UPDATE,
             request
         )
     }
 
+    private fun buildConstraints() = Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.CONNECTED)
+        .build()
+
+    private fun buildInputData(): Data = Data.Builder()
+        .putString(SyncWorker.KEY_URL, config.url)
+        .putString(SyncWorker.KEY_USERNAME, config.username)
+        .putString(SyncWorker.KEY_PASSWORD, config.password)
+        .putString(SyncWorker.KEY_DATABASE, config.database)
+        .putLong(SyncWorker.KEY_SYNC_INTERVAL, config.syncIntervalMinutes)
+        .putBoolean(SyncWorker.KEY_LIVE_SYNC, config.liveSync)
+        .putBoolean(SyncWorker.KEY_BACKGROUND_SYNC, config.backgroundSync)
+        .putInt(SyncWorker.KEY_BATCH_SIZE, config.batchSize)
+        .putBoolean(SyncWorker.KEY_DEBUG, config.debug)
+        .build()
+
     companion object {
-        private const val WORK_NAME = "rxdroid_periodic_sync"
+        private const val WORK_NAME_PREFIX = "rxdroid_sync"
         val gson = Gson()
 
-        @Volatile
-        var instance: RxDroid? = null
-            private set
+        private val instances = ConcurrentHashMap<String, RxDroid>()
+
+        fun getInstance(database: String): RxDroid? = instances[database]
 
         fun create(context: Context, config: RxDroidConfig): RxDroid {
-            val db = RxDroidDatabase.getInstance(context)
-            val client = CouchDbClient(config.url, config.username, config.password)
-            return RxDroid(context.applicationContext, config, db, client)
-                .also { instance = it }
+            val key = config.database
+            return instances[key] ?: synchronized(this) {
+                instances[key] ?: run {
+                    val db = RxDroidDatabase.getInstance(context, key)
+                    val client = CouchDbClient(config.url, config.username, config.password, config.debug)
+                    RxDroid(context.applicationContext, config, db, client)
+                        .also { instances[key] = it }
+                }
+            }
         }
     }
 }

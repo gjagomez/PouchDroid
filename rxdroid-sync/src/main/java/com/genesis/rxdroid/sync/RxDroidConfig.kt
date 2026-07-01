@@ -7,5 +7,7 @@ data class RxDroidConfig(
     val database: String,
     val syncIntervalMinutes: Long = 15L,
     val batchSize: Int = 100,
-    val liveSync: Boolean = true
+    val liveSync: Boolean = true,
+    val backgroundSync: Boolean = true,
+    val debug: Boolean = false
 )

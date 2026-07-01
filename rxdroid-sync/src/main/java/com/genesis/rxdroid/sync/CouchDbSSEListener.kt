@@ -10,27 +10,13 @@ import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.*
 import okhttp3.Credentials
 import okhttp3.Request
+import java.util.concurrent.ConcurrentHashMap
 
 private const val TAG = "RxDroid-SSE"
-private const val HEARTBEAT_MS = 10_000       // CouchDB envía heartbeat cada 10s
-private const val RECONNECT_DELAY_MS = 5_000L // igual que RxDB retryTime
+private const val HEARTBEAT_MS = 30_000
+private const val RECONNECT_DELAY_BASE_MS = 5_000L
+private const val RECONNECT_DELAY_MAX_MS = 120_000L
 
-/**
- * Escucha cambios en tiempo real desde CouchDB usando Server-Sent Events.
- * Equivalente al pull.stream$ de RxDB con feed=eventsource.
- *
- * Flujo:
- *   CouchDB /_changes?feed=eventsource
- *       │  (streaming, conexión persistente)
- *       ▼
- *   CouchDbSSEListener
- *       │  parsea cada evento
- *       ▼
- *   Room (DocumentDao.upsert)
- *       │  Room emite nuevo valor al Flow
- *       ▼
- *   UI se actualiza automáticamente
- */
 class CouchDbSSEListener(
     private val config: RxDroidConfig,
     private val dao: DocumentDao,
@@ -40,24 +26,32 @@ class CouchDbSSEListener(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val mapType = object : TypeToken<Map<String, Any?>>() {}.type
 
-    // Inicia la escucha para una colección.
-    // since = "now" para solo cambios nuevos (post-sync inicial)
-    // since = "0"   para todos los cambios desde el principio
-    fun start(collection: String, since: String = "now") {
-        scope.launch {
-            var lastSeq = since
+    // ConcurrentHashMap: acceso seguro desde main thread (start/stop) e IO dispatcher (seq updates)
+    private val activeJobs = ConcurrentHashMap<String, Job>()
+    private val lastSeqByCollection = ConcurrentHashMap<String, String>()
+
+    fun start(collection: String, since: String? = null) {
+        activeJobs[collection]?.cancel()
+        val startSince = since ?: lastSeqByCollection[collection] ?: "now"
+
+        activeJobs[collection] = scope.launch {
+            var lastSeq = startSince
+            var reconnectDelay = RECONNECT_DELAY_BASE_MS
             Log.d(TAG, "SSE started for '$collection' since='$lastSeq'")
 
             while (isActive) {
                 try {
                     listenToChanges(collection, lastSeq) { newSeq ->
                         lastSeq = newSeq
+                        lastSeqByCollection[collection] = newSeq
+                        reconnectDelay = RECONNECT_DELAY_BASE_MS
                     }
                 } catch (e: CancellationException) {
                     break
                 } catch (e: Exception) {
-                    Log.w(TAG, "SSE disconnected for '$collection': ${e.message}. Retrying in ${RECONNECT_DELAY_MS}ms...")
-                    delay(RECONNECT_DELAY_MS)
+                    Log.w(TAG, "SSE disconnected for '$collection': ${e.message}. Retrying in ${reconnectDelay}ms...")
+                    delay(reconnectDelay)
+                    reconnectDelay = minOf(reconnectDelay * 2, RECONNECT_DELAY_MAX_MS)
                 }
             }
             Log.d(TAG, "SSE stopped for '$collection'")
@@ -65,7 +59,14 @@ class CouchDbSSEListener(
     }
 
     fun stop() {
+        activeJobs.values.forEach { it.cancel() }
+        activeJobs.clear()
+    }
+
+    fun destroy() {
         scope.cancel()
+        activeJobs.clear()
+        lastSeqByCollection.clear()
     }
 
     private suspend fun listenToChanges(
@@ -87,33 +88,25 @@ class CouchDbSSEListener(
             .header("Cache-Control", "no-cache")
             .build()
 
-        // OkHttp con timeout deshabilitado para streaming persistente
         val streamClient = client.httpClient.newBuilder()
-            .readTimeout(0, java.util.concurrent.TimeUnit.SECONDS)  // sin timeout en streaming
+            .readTimeout(0, java.util.concurrent.TimeUnit.SECONDS)
             .build()
 
         streamClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 throw Exception("HTTP ${response.code}: ${response.message}")
             }
-
-            Log.d(TAG, "SSE connected to CouchDB for '$collection'")
+            Log.d(TAG, "SSE connected for '$collection'")
             val source = response.body!!.source()
 
             while (!source.exhausted() && isActive) {
                 val line = source.readUtf8Line() ?: break
-
                 when {
-                    // Línea de datos: "data: {...}"
                     line.startsWith("data:") -> {
                         val json = line.removePrefix("data:").trim()
-                        if (json.isNotEmpty()) {
-                            processEvent(collection, json, onSeqUpdate)
-                        }
+                        if (json.isNotEmpty()) processEvent(collection, json, onSeqUpdate)
                     }
-                    // Línea vacía = heartbeat de CouchDB, ignorar
                     line.isEmpty() -> Unit
-                    // Comentario SSE
                     line.startsWith(":") -> Unit
                 }
             }
@@ -129,16 +122,28 @@ class CouchDbSSEListener(
             gson.fromJson<Map<String, Any?>>(json, mapType)
         }.getOrNull() ?: return
 
-        val seq    = event["seq"] as? String ?: return
-        val docId  = event["id"]  as? String ?: return
-        val deleted = event["deleted"] as? Boolean ?: false
+        val seq    = event["seq"]?.toString() ?: return
+        val docId  = event["id"] as? String ?: return
+        val deleted = (event["deleted"] as? Boolean) ?: (event["_deleted"] as? Boolean) ?: false
 
-        // Ignorar documentos de diseño y checkpoints internos
-        if (docId.startsWith("_")) return
+        // Ignorar docs internos de CouchDB (_design/, _local/, etc.)
+        // Avanzar siempre el seq para no repetir el evento en cada reconexión
+        if (docId.startsWith("_")) {
+            onSeqUpdate(seq)
+            return
+        }
+
+        Log.d(TAG, "SSE event: id=$docId, deleted=$deleted, seq=$seq")
+        val compositeId = "$collection|$docId"
 
         val entity = if (deleted) {
+            // Solo procesar el delete si el doc existe en esta colección
+            if (dao.getById(compositeId) == null) {
+                onSeqUpdate(seq)
+                return
+            }
             DocumentEntity(
-                compositeId = "$collection|$docId",
+                compositeId = compositeId,
                 collection = collection,
                 docId = docId,
                 data = "{}",
@@ -149,11 +154,26 @@ class CouchDbSSEListener(
         } else {
             @Suppress("UNCHECKED_CAST")
             val docData = (event["doc"] as? Map<String, Any?>) ?: mapOf("_id" to docId)
+
+            // Filtrar por colección: solo procesar si rxCollection coincide (o no tiene campo)
+            val docCollection = docData[FIELD_COLLECTION] as? String
+            if (docCollection != null && docCollection != collection) {
+                onSeqUpdate(seq)
+                return
+            }
+
             val updatedAt = (docData["updatedAt"] as? Double)?.toLong()
                 ?: System.currentTimeMillis()
 
+            val existing = dao.getById(compositeId)
+            if (existing?.syncStatus == SyncStatus.PENDING && existing.updatedAt >= updatedAt) {
+                Log.d(TAG, "SSE skipped '$docId' — local PENDING is newer")
+                onSeqUpdate(seq)
+                return
+            }
+
             DocumentEntity(
-                compositeId = "$collection|$docId",
+                compositeId = compositeId,
                 collection = collection,
                 docId = docId,
                 data = gson.toJson(docData),

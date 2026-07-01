@@ -17,10 +17,12 @@ private const val RETRY_DELAY_MS = 5_000L  // 5 seg igual que RxDB retryTime
 class ChangeWatcher(
     private val context: Context,
     private val syncManager: SyncManager,
-    private val collections: Set<String>
+    private val collections: Set<String>,
+    private val onError: (String) -> Unit = {}
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var networkReconnectJob: Job? = null
 
     // Observa cambios locales pendientes y los sube inmediatamente
     // changeFlow: Flow que emite cuando hay escrituras locales nuevas
@@ -39,17 +41,20 @@ class ChangeWatcher(
 
     // Push inmediato con retry de 5s (igual que RxDB retryTime)
     private suspend fun pushWithRetry() {
+        var lastError: Exception? = null
         var attempts = 0
         while (attempts < 3) {
             try {
                 collections.forEach { syncManager.pushImmediate(it) }
                 return
             } catch (e: Exception) {
+                lastError = e
                 attempts++
                 Log.w(TAG, "Push attempt $attempts failed: ${e.message}")
                 if (attempts < 3) delay(RETRY_DELAY_MS)
             }
         }
+        lastError?.let { onError("Sync error: ${it.message}") }
     }
 
     // Detecta reconexión y sincroniza inmediatamente (como navigator.onLine en RxDB)
@@ -58,9 +63,11 @@ class ChangeWatcher(
 
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.d(TAG, "Network available — triggering immediate sync")
-                scope.launch {
-                    delay(1_000) // espera 1s a que la red estabilice
+                Log.d(TAG, "Network available — scheduling sync")
+                // Cancela y re-agenda: descarta reconexiones rápidas en red inestable
+                networkReconnectJob?.cancel()
+                networkReconnectJob = scope.launch {
+                    delay(2_000) // debounce: espera 2s a que la red estabilice
                     collections.forEach {
                         runCatching { syncManager.sync(it) }
                     }

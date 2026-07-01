@@ -23,7 +23,7 @@ interface CouchDbApi {
     ): ChangesResponse
 
     // Trae docs individuales cuando se necesita el contenido
-    @GET("{db}/_all_docs")
+    @POST("{db}/_all_docs")
     suspend fun getDocs(
         @Path("db") db: String,
         @Body keys: AllDocsRequest,
@@ -56,13 +56,11 @@ interface CouchDbApi {
     ): Response<Map<String, Any?>>
 }
 
-private fun isDebugBuild(): Boolean =
-    android.os.Build.TYPE == "userdebug" || android.os.Build.TYPE == "eng"
-
 class CouchDbClient(
     baseUrl: String,
     username: String,
-    password: String
+    password: String,
+    debug: Boolean = false
 ) {
     val api: CouchDbApi
     lateinit var httpClient: OkHttpClient  // expuesto para SSE listener
@@ -83,9 +81,9 @@ class CouchDbClient(
                 chain.proceed(request)
             }
             .apply {
-                if (isDebugBuild()) {
+                if (debug) {
                     addInterceptor(HttpLoggingInterceptor().apply {
-                        level = HttpLoggingInterceptor.Level.BASIC
+                        level = HttpLoggingInterceptor.Level.BODY
                     })
                 }
             }

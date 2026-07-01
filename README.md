@@ -13,10 +13,11 @@ Inspired by [PouchDB](https://pouchdb.com) and [RxDB](https://rxdb.info). Built 
 - **Reactive queries** — collections return `Flow<List<T>>` that update automatically on any local or remote change.
 - **Dynamic JSON** — no data class required. Works with any document structure using `RxDocument`.
 - **Typed mode** — optional data class support for collections with a fixed schema.
+- **Multi-database support** — use multiple `RxDroid` instances simultaneously, one per CouchDB database.
 - **Multi-device sync** — every device syncs independently via CouchDB as the central hub. Changes from one device reach all others in real-time.
 - **Checkpoint isolation** — each device tracks its own sync position using a unique device ID. Devices never overwrite each other's checkpoints.
 - **Two-phase pull** — fetches change IDs first, then document content in chunks. Efficient for large documents and slow connections.
-- **Background sync** — WorkManager handles periodic sync and retries when the app is in the background.
+- **Background sync** — WorkManager handles periodic sync and retries when the app is in the background. Configurable on/off at runtime.
 - **Conflict resolution** — last-write-wins by `updatedAt` field.
 
 ---
@@ -208,22 +209,67 @@ RxDroidConfig(
     password             = "your_password",
     database             = "my_database",
     liveSync             = true,    // enable SSE real-time pull (default: true)
+    backgroundSync       = true,    // enable WorkManager periodic sync (default: true)
     syncIntervalMinutes  = 15L,     // WorkManager background interval (default: 15)
-    batchSize            = 50       // documents per sync page (default: 50)
+    batchSize            = 100,     // documents per sync page (default: 100)
+    debug                = false    // log HTTP requests and responses (default: false)
 )
 ```
+
+---
+
+## Multiple Databases
+
+You can run multiple `RxDroid` instances simultaneously, one per CouchDB database. Each instance maintains its own Room database, sync checkpoint, SSE stream, and WorkManager job — they are fully isolated.
+
+```kotlin
+class MyApp : Application() {
+    lateinit var formDb: RxDroid
+    lateinit var casesDb: RxDroid
+
+    override fun onCreate() {
+        super.onCreate()
+
+        formDb = RxDroid.create(
+            context = this,
+            config  = RxDroidConfig(
+                url      = "https://your-server.com:6984/",
+                username = "admin",
+                password = "secret",
+                database = "db_forms"
+            )
+        )
+
+        casesDb = RxDroid.create(
+            context = this,
+            config  = RxDroidConfig(
+                url      = "https://your-server.com:6984/",
+                username = "admin",
+                password = "secret",
+                database = "db_cases"
+            )
+        )
+    }
+}
+```
+
+Each instance stores its Room data in a separate file (`rxdroid_db_forms.db`, `rxdroid_db_cases.db`) and uses a separate WorkManager job name so periodic syncs never interfere.
+
+> **Note:** multiple collections sharing a single database is also supported. Every document pushed to CouchDB is tagged with an internal `rxCollection` field so each collection only processes its own documents from the shared `/_changes` feed.
 
 ---
 
 ## Sync Control
 
 ```kotlin
-db.startSync()        // start SSE + WorkManager + local change watcher
-db.stopSync()         // stop all sync
-db.syncNow()          // trigger immediate one-time sync via WorkManager
-db.pauseLiveSync()    // pause SSE stream (call in onPause)
-db.resumeLiveSync()   // resume SSE stream (call in onResume)
-db.syncAll()          // suspend function: sync all collections now
+db.startSync()               // start SSE + WorkManager + local change watcher
+db.stopSync()                // stop all sync (SSE, WorkManager, change watcher)
+db.syncNow()                 // trigger immediate one-time sync via WorkManager (cancellable)
+db.pauseLiveSync()           // pause SSE stream (call in onPause)
+db.resumeLiveSync()          // resume SSE stream + trigger a catch-up sync (call in onResume)
+db.syncAll()                 // suspend function: sync all collections now
+db.enableBackgroundSync()    // re-enable WorkManager periodic sync at runtime
+db.disableBackgroundSync()   // cancel WorkManager periodic sync at runtime
 ```
 
 **Recommended lifecycle usage:**
@@ -241,6 +287,8 @@ override fun onPause() {
 ```
 
 > `pauseLiveSync()` / `resumeLiveSync()` only affect the SSE stream. WorkManager background sync continues regardless of app state.
+
+To disable background sync entirely, set `backgroundSync = false` in `RxDroidConfig`, or call `disableBackgroundSync()` at runtime. Re-enable it with `enableBackgroundSync()`. This is useful for apps that only want to sync while the user is active, or for reducing battery usage on low-power devices.
 
 ---
 

@@ -2,14 +2,22 @@ package com.genesis.rxdroid.sync.couch
 
 import com.google.gson.annotations.SerializedName
 
-data class ChangesResponse(
+// last_seq es String en CouchDB 2.x (cluster) y número en CouchDB 3.x (single-node)
+class ChangesResponse(
     val results: List<ChangeRow>,
-    @SerializedName("last_seq") val lastSeq: String
-)
+    @SerializedName("last_seq") private val lastSeqRaw: Any = "0"
+) {
+    val lastSeq: String get() = when (val v = lastSeqRaw) {
+        is Double -> v.toLong().toString()
+        is Long   -> v.toString()
+        is Int    -> v.toString()
+        else      -> v.toString()
+    }
+}
 
 data class ChangeRow(
     val id: String,
-    val seq: String,
+    // seq puede ser String (CouchDB 2.x) o número (CouchDB 1.x) — no lo usamos, Gson lo ignora
     val deleted: Boolean = false,
     val doc: Map<String, Any?>? = null
 )
